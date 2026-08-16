@@ -1,0 +1,4 @@
+feedparser
+ollama
+torch
+transformers
