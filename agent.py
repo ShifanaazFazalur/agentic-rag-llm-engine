@@ -1,121 +1,87 @@
 """
-News Summarizer Agent (with ML Sentiment Analysis)
-====================================================
-Fetches today's tech/AI news, runs each headline through a fine-tuned
-DistilBERT sentiment classifier, then uses a local LLM to summarize
-and categorize — producing a structured daily digest.
+WiFi Anomaly Digest Agent
+===========================
+Analyzes a WiFi packet capture for signs of malicious or anomalous activity
+(deauth floods, rogue APs, ARP spoofing, probe floods, high retry rates,
+malformed packets), then uses a local LLM to explain the findings and rate
+the risk level — producing a structured markdown digest.
 
 Pipeline:
-  1. Fetch      — pull articles from tech/AI RSS feeds (no API key)
-  2. Classify   — run each headline through fine-tuned DistilBERT model
-  3. Summarize  — send to local LLM (Ollama/Llama 3.2) for summary + category
-  4. Save       — write grouped markdown digest
+  1. Analyze  — run targeted tshark filters against the capture (capture_analyzer.py)
+  2. Explain  — send the findings summary to a local LLM (Ollama/Llama 3.2)
+  3. Save     — write the digest to markdown
 
 Requirements:
   pip install -r requirements.txt
-
-  Install Ollama: https://ollama.com → then: ollama pull llama3.2
-
-  Fine-tuned model: train the sentiment classifier first by running:
-    cd ../climate_sentiment && python train.py
-  This saves the model to ../climate_sentiment/best_model/
+  Install Wireshark (for tshark): https://www.wireshark.org
+  Install Ollama: https://ollama.com -> then: ollama pull llama3.2
 
 Usage:
-  python agent.py
+  python agent.py path/to/capture.pcap
 """
 
-import torch
-import feedparser
-import ollama
+import sys
 from pathlib import Path
 from datetime import datetime
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+import ollama
+
+from capture_analyzer import analyze_capture, format_findings
 
 
-# ─── Config ───────────────────────────────────────────────────────────────────
+# --- Config ------------------------------------------------------------------
 
-FEEDS = {
-    "TechCrunch AI":   "https://techcrunch.com/category/artificial-intelligence/feed/",
-    "MIT Tech Review": "https://www.technologyreview.com/feed/",
-    "Ars Technica":    "https://feeds.arstechnica.com/arstechnica/technology-lab",
-    "The Verge":       "https://www.theverge.com/rss/index.xml",
-}
+LLM_MODEL = "llama3.2"
 
-CATEGORIES   = ["AI & ML", "Hardware", "Software", "Research", "Industry News", "Other"]
-SENTIMENTS   = ["Negative", "Neutral", "Positive"]
-MAX_ARTICLES = 8
-LLM_MODEL    = "llama3.2"
-MODEL_DIR    = "../climate_sentiment/best_model"
-MAX_LENGTH   = 128
+SYSTEM_PROMPT = """You are a wireless network security assistant. You will be given
+a summary of findings from a WiFi packet capture, along with a risk level that has
+already been determined. Write a 2-4 sentence plain-English explanation of what's
+happening on the network and why it was rated at that risk level. Do not restate
+the risk level as a heading — just explain. Do not use markdown formatting."""
 
 
-# ─── Step 1: Fetch ────────────────────────────────────────────────────────────
+# --- Step 1b: Deterministic risk scoring ---------------------------------------
+# Risk is computed from the findings directly, not left up to the LLM to decide —
+# this keeps it consistent, doesn't depend on the model following an exact output
+# format, and — critically — every level comes with the exact reason it was
+# triggered, so "High" or "Medium" is never an unexplained label.
+#
+# Defined thresholds:
+#   HIGH   — more than 20 deauth frames, OR any ARP conflict
+#   MEDIUM — a probe-flood source, OR retry rate over 20%, OR any deauth frames at all
+#   LOW    — none of the above
 
-def fetch_articles(feeds: dict, max_total: int) -> list[dict]:
-    articles = []
-    for source, url in feeds.items():
-        print(f"  Fetching {source}...")
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries[:3]:
-                articles.append({
-                    "source":  source,
-                    "title":   entry.get("title", "No title"),
-                    "summary": entry.get("summary", entry.get("description", ""))[:500],
-                    "link":    entry.get("link", ""),
-                })
-        except Exception as e:
-            print(f"    Could not fetch {source}: {e}")
-    return articles[:max_total]
+def compute_risk_level(findings: dict) -> dict:
+    """Returns {"level": "High"/"Medium"/"Low", "reasons": [list of triggered reasons]}."""
+    reasons = []
 
+    if findings["deauth_frames"] > 20:
+        reasons.append(f"{findings['deauth_frames']} deauthentication frames (threshold: >20)")
+    if findings["arp_conflicts"]:
+        reasons.append(f"{len(findings['arp_conflicts'])} ARP conflict(s) detected")
+    if reasons:
+        return {"level": "High", "reasons": reasons}
 
-# ─── Step 2: Sentiment Classification (your fine-tuned ML model) ─────────────
+    if findings["probe_flood_sources"]:
+        reasons.append(f"{len(findings['probe_flood_sources'])} device(s) sending probe floods (threshold: >=50 probes)")
+    if findings["retry_rate_pct"] > 20:
+        reasons.append(f"retry rate of {findings['retry_rate_pct']}% (threshold: >20%)")
+    if findings["deauth_frames"] > 0:
+        reasons.append(f"{findings['deauth_frames']} deauthentication frame(s) present (below High threshold of 20)")
+    if reasons:
+        return {"level": "Medium", "reasons": reasons}
 
-def load_sentiment_model(model_dir: str):
-    """Load the fine-tuned DistilBERT model trained in climate_sentiment/train.py"""
-    print(f"  Loading fine-tuned sentiment model from {model_dir}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    model     = AutoModelForSequenceClassification.from_pretrained(model_dir)
-    model.eval()
-    return tokenizer, model
-
-
-def classify_sentiment(text: str, tokenizer, model) -> dict:
-    """Run a headline through the fine-tuned model and return label + confidence."""
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=MAX_LENGTH,
-        padding=True,
-    )
-    with torch.no_grad():
-        logits = model(**inputs).logits
-
-    probs   = torch.softmax(logits, dim=-1).squeeze().tolist()
-    pred_id = int(torch.argmax(logits))
-    label   = SENTIMENTS[pred_id] if pred_id < len(SENTIMENTS) else "Neutral"
-
-    return {
-        "sentiment":   label,
-        "confidence":  round(probs[pred_id], 3),
-    }
+    return {"level": "Low", "reasons": ["no deauth activity, rogue APs, ARP conflicts, probe floods, or elevated retry rate"]}
 
 
-# ─── Step 3: Summarize + Categorize (LLM) ────────────────────────────────────
+# --- Step 2: Explain findings (LLM) -------------------------------------------
 
-SYSTEM_PROMPT = """You are a tech news assistant.
-Given a news article title, snippet, and its sentiment label, return ONLY this exact format:
-
-CATEGORY: <one of: AI & ML, Hardware, Software, Research, Industry News, Other>
-SUMMARY: <1-2 sentence plain English summary of what happened and why it matters>"""
-
-
-def process_article(article: dict) -> dict:
+def explain_findings(findings_summary: str, risk: dict) -> str:
+    reasons_text = "; ".join(risk["reasons"])
     prompt = (
-        f"Title: {article['title']}\n"
-        f"Sentiment: {article['sentiment']} (confidence: {article['confidence']})\n"
-        f"Snippet: {article['summary']}"
+        f"Risk level already determined: {risk['level']}\n"
+        f"Reasons: {reasons_text}\n\n"
+        f"Findings:\n{findings_summary}"
     )
     try:
         response = ollama.chat(
@@ -125,107 +91,70 @@ def process_article(article: dict) -> dict:
                 {"role": "user",   "content": prompt},
             ],
         )
-        raw      = response["message"]["content"].strip()
-        category = "Other"
-        summary  = article["title"]
-        for line in raw.splitlines():
-            if line.startswith("CATEGORY:"):
-                category = line.replace("CATEGORY:", "").strip()
-            elif line.startswith("SUMMARY:"):
-                summary = line.replace("SUMMARY:", "").strip()
+        return response["message"]["content"].strip()
     except Exception as e:
-        category = "Other"
-        summary  = f"(LLM unavailable: {e})"
-
-    return {**article, "category": category, "llm_summary": summary}
+        return f"(LLM unavailable: {e})"
 
 
-# ─── Step 4: Save Digest ─────────────────────────────────────────────────────
+# --- Step 3: Save Digest -------------------------------------------------------
 
-SENTIMENT_EMOJI = {"Positive": "🟢", "Neutral": "🟡", "Negative": "🔴"}
+RISK_EMOJI = {"Low": "🟢", "Medium": "🟡", "High": "🔴"}
 
-def save_digest(articles: list[dict]) -> str:
-    date_str    = datetime.now().strftime("%B %d, %Y")
+def save_digest(pcap_path: str, findings: dict, verdict: dict) -> str:
+    date_str = datetime.now().strftime("%B %d, %Y")
     output_path = f"digest_{datetime.now().strftime('%Y-%m-%d')}.md"
-
-    # Sentiment summary counts
-    counts = {s: sum(1 for a in articles if a["sentiment"] == s) for s in SENTIMENTS}
-
-    grouped: dict[str, list] = {cat: [] for cat in CATEGORIES}
-    for article in articles:
-        cat = article["category"] if article["category"] in CATEGORIES else "Other"
-        grouped[cat].append(article)
+    risk = verdict["risk"]
+    emoji = RISK_EMOJI.get(risk["level"], "🟡")
+    reasons_list = "\n".join(f"- {r}" for r in risk["reasons"])
 
     lines = [
-        f"# 🗞 Tech & AI News Digest",
-        f"**{date_str}**\n",
-        f"## Sentiment Overview",
-        f"🟢 Positive: {counts['Positive']}  |  "
-        f"🟡 Neutral: {counts['Neutral']}  |  "
-        f"🔴 Negative: {counts['Negative']}\n",
+        "# 📡 WiFi Anomaly Digest",
+        f"**{date_str}** · Capture: `{pcap_path}`\n",
+        f"## Risk Level: {emoji} {risk['level']}\n",
+        "**Why:**",
+        reasons_list + "\n",
+        f"{verdict['explanation']}\n",
+        "## Raw Findings\n",
+        format_findings(findings),
     ]
-
-    for category in CATEGORIES:
-        items = grouped[category]
-        if not items:
-            continue
-        lines.append(f"\n## {category}\n")
-        for a in items:
-            emoji = SENTIMENT_EMOJI.get(a["sentiment"], "🟡")
-            lines.append(f"### [{a['title']}]({a['link']})")
-            lines.append(f"*{a['source']}* · {emoji} {a['sentiment']} ({a['confidence']})\n")
-            lines.append(f"{a['llm_summary']}\n")
 
     Path(output_path).write_text("\n".join(lines), encoding="utf-8")
     return output_path
 
 
-# ─── Agent Orchestrator ───────────────────────────────────────────────────────
+# --- Agent Orchestrator ---------------------------------------------------------
 
-def run_agent():
-    print("\n" + "="*50)
-    print("  News Summarizer Agent + ML Sentiment")
-    print("="*50 + "\n")
+def run_agent(pcap_path: str):
+    print("\n" + "=" * 50)
+    print("  WiFi Anomaly Digest Agent")
+    print("=" * 50 + "\n")
 
-    # Step 1: Fetch
-    print("[ Step 1 ] Fetching articles...")
-    articles = fetch_articles(FEEDS, MAX_ARTICLES)
-    print(f"  {len(articles)} articles fetched.\n")
-
-    # Step 2: Classify sentiment with fine-tuned model
-    print("[ Step 2 ] Running sentiment classification...")
-    try:
-        tokenizer, model = load_sentiment_model(MODEL_DIR)
-        for article in articles:
-            result = classify_sentiment(article["title"], tokenizer, model)
-            article.update(result)
-            print(f"  {result['sentiment']:8s} ({result['confidence']}) — {article['title'][:55]}...")
-    except Exception as e:
-        print(f"  Model not found ({e}). Run climate_sentiment/train.py first.")
-        print("  Defaulting to Neutral for all articles.\n")
-        for article in articles:
-            article.update({"sentiment": "Neutral", "confidence": 0.0})
+    print("[ Step 1 ] Analyzing capture...")
+    findings = analyze_capture(pcap_path)
+    print(format_findings(findings))
     print()
 
-    # Step 3: Summarize + Categorize with LLM
-    print("[ Step 3 ] Summarizing and categorizing with LLM...")
-    processed = []
-    for i, article in enumerate(articles, 1):
-        print(f"  [{i}/{len(articles)}] {article['title'][:55]}...")
-        processed.append(process_article(article))
+    print("[ Step 2 ] Scoring risk and generating explanation with LLM...")
+    risk = compute_risk_level(findings)
+    explanation = explain_findings(format_findings(findings), risk)
+    verdict = {"risk": risk, "explanation": explanation}
+    print(f"  Risk: {risk['level']}")
+    for r in risk["reasons"]:
+        print(f"    - {r}")
     print()
 
-    # Step 4: Save
-    print("[ Step 4 ] Saving digest...")
-    output_path = save_digest(processed)
+    print("[ Step 3 ] Saving digest...")
+    output_path = save_digest(pcap_path, findings, verdict)
     print(f"  Saved: {output_path}\n")
 
-    print("="*50)
-    for a in processed:
-        emoji = SENTIMENT_EMOJI.get(a["sentiment"], "🟡")
-        print(f"  {emoji} [{a['category']}] {a['title'][:50]}...")
+    print("=" * 50)
+    emoji = RISK_EMOJI.get(risk["level"], "🟡")
+    print(f"  {emoji} Risk: {risk['level']}")
     print(f"\nDigest saved to: {output_path}\n")
 
 
 if __name__ == "__main__":
-    run_agent()
+    if len(sys.argv) < 2:
+        print("Usage: python agent.py path/to/capture.pcap")
+        sys.exit(1)
+    run_agent(sys.argv[1])

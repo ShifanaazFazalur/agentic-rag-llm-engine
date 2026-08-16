@@ -1,4 +1,1 @@
-feedparser
 ollama
-torch
-transformers
