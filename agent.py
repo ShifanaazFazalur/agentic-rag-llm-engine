@@ -2,18 +2,18 @@
 WiFi Anomaly Digest Agent
 ===========================
 Analyzes a WiFi packet capture for signs of malicious or anomalous activity
-(deauth floods, rogue APs, ARP spoofing, probe floods, high retry rates,
-malformed packets), then uses a local LLM to explain the findings and rate
-the risk level — producing a structured markdown digest.
+(deauth floods, probe floods, high retry rates, malformed packets), then uses
+a local LLM to explain the findings and rate the risk level — producing a
+structured markdown digest.
 
 Pipeline:
-  1. Analyze  — run targeted tshark filters against the capture (capture_analyzer.py)
+  1. Analyze  — run targeted Wireshark filters against the capture (capture_analyzer.py)
   2. Explain  — send the findings summary to a local LLM (Ollama/Llama 3.2)
   3. Save     — write the digest to markdown
 
 Requirements:
   pip install -r requirements.txt
-  Install Wireshark (for tshark): https://www.wireshark.org
+  Install Wireshark: https://www.wireshark.org
   Install Ollama: https://ollama.com -> then: ollama pull llama3.2
 
 Usage:
@@ -47,7 +47,7 @@ the risk level as a heading — just explain. Do not use markdown formatting."""
 # triggered, so "High" or "Medium" is never an unexplained label.
 #
 # Defined thresholds:
-#   HIGH   — more than 20 deauth frames, OR any ARP conflict
+#   HIGH   — more than 20 deauth frames
 #   MEDIUM — a probe-flood source, OR retry rate over 20%, OR any deauth frames at all
 #   LOW    — none of the above
 
@@ -57,8 +57,6 @@ def compute_risk_level(findings: dict) -> dict:
 
     if findings["deauth_frames"] > 20:
         reasons.append(f"{findings['deauth_frames']} deauthentication frames (threshold: >20)")
-    if findings["arp_conflicts"]:
-        reasons.append(f"{len(findings['arp_conflicts'])} ARP conflict(s) detected")
     if reasons:
         return {"level": "High", "reasons": reasons}
 
@@ -71,7 +69,7 @@ def compute_risk_level(findings: dict) -> dict:
     if reasons:
         return {"level": "Medium", "reasons": reasons}
 
-    return {"level": "Low", "reasons": ["no deauth activity, rogue APs, ARP conflicts, probe floods, or elevated retry rate"]}
+    return {"level": "Low", "reasons": ["no deauth activity, probe floods, or elevated retry rate"]}
 
 
 # --- Step 2: Explain findings (LLM) -------------------------------------------
