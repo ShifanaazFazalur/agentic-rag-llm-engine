@@ -14,7 +14,8 @@ daily digest via a locally-hosted LLM (Llama 3.2 via Ollama).
 Python, PyTorch, Hugging Face Transformers, Ollama, MLflow
 
 ## Setup
-[your actual install/run steps here]
+Requires [Ollama](https://ollama.com) running locally with `ollama pull llama3.2`.
+
 
 ## Results
 - Sentiment classifier: 0.54 macro-F1 on 800+ labeled tweets, 3-class classification
